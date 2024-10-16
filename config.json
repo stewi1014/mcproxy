@@ -1,0 +1,21 @@
+{
+    "listen": {
+        "address": ":25565",
+        "fallback_version": "1.21.1",
+        "fallback_protocol": 767
+    },
+    "aws": {
+        "aws_key_id": "",
+        "aws_key_secret": ""
+    },
+    "proxies": [
+        {
+            "domain": "example.localhost",
+            "destination_ip": "localhost",
+            "destination_port": 25566,
+            "destination_version": "1.21.1",
+            "destination_protocol": 767,
+            "dummy_server": "test server"
+        }
+    ]
+}
