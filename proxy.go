@@ -17,7 +17,10 @@ type ProxyConfig struct {
 	Destination_Protocol int
 	Destination_Version  string
 
+	Shutdown_Timeout int
+
 	Dummy_Server string
+	Ec2_Server   *EC2Config
 }
 
 func NewProxy(config ProxyConfig) (*Proxy, error) {
@@ -27,6 +30,12 @@ func NewProxy(config ProxyConfig) (*Proxy, error) {
 
 	if config.Dummy_Server != "" {
 		proxy.server = NewDummyServer(config.Dummy_Server)
+	} else if config.Ec2_Server != nil {
+		server, err := NewEC2Server(*config.Ec2_Server)
+		if err != nil {
+			return nil, err
+		}
+		proxy.server = server
 	} else {
 		return nil, fmt.Errorf("no backend given for %v", config.Domain)
 	}
@@ -38,9 +47,8 @@ func NewProxy(config ProxyConfig) (*Proxy, error) {
 
 const (
 	serverStateStopped  = 0
-	serverStartStarted  = 1
+	serverStateStarted  = 1
 	serverStateStarting = 2
-	serverStateStopping = 3
 	serverStateFucked   = 4
 )
 
@@ -60,69 +68,70 @@ type Proxy struct {
 }
 
 func (p *Proxy) handleServer() {
+	p.startServerChan = make(chan struct{}, 1)
+
+	status, err := p.getServerStatus()
+	if err == nil {
+		p.hasServerInfo = true
+		p.serverState = serverStateStarted
+		p.description = status.JSONResponse.Description
+		p.maxPlayers = status.JSONResponse.Players.Max
+		p.protocolVersion = status.JSONResponse.Version.Protocol
+		p.mcVersion = status.JSONResponse.Version.Name
+	}
+
+	var startTime time.Time
 	var lastStartDuration time.Duration
-	p.startServerChan = make(chan struct{})
+	playerLastOnline := time.Now()
+	t := time.NewTicker(time.Minute * time.Duration(p.config.Shutdown_Timeout) / 10)
 
-RESET:
 	for {
-		status, err := p.getServerStatus()
-		if err == nil {
-			p.hasServerInfo = true
-			p.serverState = serverStartStarted
-			p.description = status.JSONResponse.Description
-			p.maxPlayers = status.JSONResponse.Players.Max
-			p.protocolVersion = status.JSONResponse.Version.Protocol
-			p.mcVersion = status.JSONResponse.Version.Name
-		}
+		select {
+		case <-t.C:
+			switch p.serverState {
+			case serverStateStopped, serverStateFucked:
+				continue
 
-		if p.serverState == serverStartStarted {
-			t := time.NewTicker(time.Second * 10)
-			playerLastOnline := time.Now()
-			for range t.C {
-				status, err := p.getServerStatus()
-				if err != nil {
-					log.Println(err)
-					p.serverState = serverStateStopped
-					goto RESET
+			case serverStateStarting:
+				_, err := p.getServerStatus()
+				if err == nil {
+					p.serverState = serverStateStarted
+					lastStartDuration = time.Now().Sub(startTime)
 				}
 
-				if status.JSONResponse.Players.Online > 0 {
+			case serverStateStarted:
+				state, err := p.getServerStatus()
+				if err != nil {
+					p.serverState = serverStateFucked
+				} else if state.JSONResponse.Players.Online > 0 {
 					playerLastOnline = time.Now()
 				}
 
-				if playerLastOnline.Add(time.Minute * 2).Before(time.Now()) {
+				if playerLastOnline.
+					Add(time.Second * time.Duration(p.config.Shutdown_Timeout)).
+					Before(time.Now()) {
+					fmt.Println("stopping", p.config.Domain)
 					err := p.server.StopServer()
 					if err != nil {
 						log.Println(err)
 					}
+					p.serverState = serverStateStopped
 				}
 			}
-		} else {
-			<-p.startServerChan
-			err := p.server.StartServer()
-			if err != nil {
-				log.Println(err)
-				goto RESET
-			}
+		case <-p.startServerChan:
+			if p.serverState == serverStateStopped {
+				startTime = time.Now()
+				if lastStartDuration != 0 {
+					p.serverEstStarted = time.Now().Add(lastStartDuration)
+				}
 
-			startTime := time.Now()
-			if lastStartDuration != 0 {
-				p.serverEstStarted = startTime.Add(lastStartDuration)
-			}
-
-			t := time.NewTicker(time.Second * 10)
-			for range t.C {
-				_, err := p.getServerStatus()
+				fmt.Println("starting", p.config.Domain)
+				err := p.server.StartServer()
 				if err != nil {
-					if time.Now().Sub(startTime) > time.Minute*5 {
-						p.serverState = serverStateFucked
-						goto RESET
-					}
-
-					continue
+					p.serverState = serverStateFucked
 				}
 
-				p.serverState = serverStartStarted
+				p.serverState = serverStateStarting
 			}
 		}
 	}
@@ -165,10 +174,8 @@ func (p *Proxy) getStatusMessage() string {
 			return "server is starting"
 		}
 		return fmt.Sprintf("server starting (approx %v remaining)", p.serverEstStarted.Sub(time.Now()))
-	case serverStartStarted:
+	case serverStateStarted:
 		return "server is running"
-	case serverStateStopping:
-		return "server is going to sleep"
 	case serverStateFucked:
 		return "server is f**ked"
 	default:
@@ -177,7 +184,8 @@ func (p *Proxy) getStatusMessage() string {
 }
 
 func (p *Proxy) handleLogin(handshake *protocol.HandshakeIntention, mcconn *protocol.Conn) error {
-	if p.serverState == serverStartStarted || p.serverState == serverStateStarting {
+	_, err := p.getServerStatus()
+	if p.serverState == serverStateStarted || err == nil {
 		conn, err := net.Dial("tcp", fmt.Sprintf("%v:%v", p.config.Destination_Ip, p.config.Destination_Port))
 		if err != nil {
 			return err
@@ -187,7 +195,6 @@ func (p *Proxy) handleLogin(handshake *protocol.HandshakeIntention, mcconn *prot
 	}
 
 	if p.serverState == serverStateStopped {
-		p.serverState = serverStateStarting
 		p.startServerChan <- struct{}{}
 	}
 
@@ -200,6 +207,7 @@ func (p *Proxy) handleLogin(handshake *protocol.HandshakeIntention, mcconn *prot
 func (p *Proxy) getStatus() *protocol.StatusResponse {
 	status, err := p.getServerStatus()
 	if err == nil {
+		p.serverState = serverStateStarted
 		return status
 	}
 
@@ -221,13 +229,17 @@ func (p *Proxy) getStatus() *protocol.StatusResponse {
 }
 
 func (p *Proxy) getServerStatus() (*protocol.StatusResponse, error) {
-	conn, err := net.Dial("tcp", fmt.Sprintf("%v:%v", p.config.Destination_Ip, p.config.Destination_Port))
+	conn, err := net.DialTimeout(
+		"tcp",
+		fmt.Sprintf("%v:%v", p.config.Destination_Ip, p.config.Destination_Port),
+		time.Second*2,
+	)
 	if err != nil {
 		return &protocol.StatusResponse{}, err
 	}
 	defer conn.Close()
 
-	err = conn.SetDeadline(time.Now().Add(time.Second * 10))
+	err = conn.SetDeadline(time.Now().Add(time.Second * 3))
 	if err != nil {
 		return &protocol.StatusResponse{}, err
 	}
