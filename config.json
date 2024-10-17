@@ -7,14 +7,14 @@
     "proxies": [
         {
             "domain": "example.localhost",
-            "destination_ip": "localhost",
-            "destination_port": 25566,
+            "destination_ip": "lenqua.link",
+            "destination_port": 25560,
             "destination_version": "1.21.1",
             "destination_protocol": 767,
-            "shutdown_timeout": 10,
+            "shutdown_timeout": 60,
             "ec2_server": {
                 "region": "ap-southeast-2",
-                "instance_id": "i-06c867f68bd2b90cf",
+                "instance_id": "i-077dc0edcdeb157f9",
                 "hibernate": false
             }
         }

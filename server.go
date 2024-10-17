@@ -9,30 +9,17 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 )
 
+const (
+	ServerStateOff      = 1
+	ServerStateStarting = 2
+	ServerStateOn       = 3
+	ServerStateStopping = 4
+)
+
 type Server interface {
-	IsRunning() (bool, error)
+	State() (int, error)
 	StartServer() error
 	StopServer() error
-}
-
-func NewDummyServer(name string) Server {
-	return dummyServer(name)
-}
-
-type dummyServer string
-
-func (l dummyServer) IsRunning() (bool, error) {
-	return true, nil
-}
-
-func (l dummyServer) StartServer() error {
-	fmt.Println("start server", l)
-	return nil
-}
-
-func (l dummyServer) StopServer() error {
-	fmt.Println("start server", l)
-	return nil
 }
 
 type EC2Config struct {
@@ -60,7 +47,7 @@ type ec2Server struct {
 	hibernate   bool
 }
 
-func (e *ec2Server) IsRunning() (bool, error) {
+func (e *ec2Server) State() (int, error) {
 	includeAll := true
 	client := ec2.NewFromConfig(e.aws_config)
 	out, err := client.DescribeInstanceStatus(context.TODO(), &ec2.DescribeInstanceStatusInput{
@@ -68,22 +55,36 @@ func (e *ec2Server) IsRunning() (bool, error) {
 		InstanceIds:         []string{e.instance_id},
 	})
 	if err != nil {
-		return false, err
+		return 0, err
 	}
 
 	if len(out.InstanceStatuses) == 0 {
-		return false, fmt.Errorf("unexpected nil in AWS InstanceStatuses")
+		return 0, fmt.Errorf("unexpected nil in AWS InstanceStatuses")
 	}
 
 	if out.InstanceStatuses[0].InstanceState == nil {
-		return false, fmt.Errorf("unexpected nil in AWS InstanceStatuses[0].InstanceState")
+		return 0, fmt.Errorf("unexpected nil in AWS InstanceStatuses[0].InstanceState")
 	}
 
 	if out.InstanceStatuses[0].InstanceState.Code == nil {
-		return false, fmt.Errorf("unexpected nil in AWS InstanceStatuses[0].InstanceState.Code")
+		return 0, fmt.Errorf("unexpected nil in AWS InstanceStatuses[0].InstanceState.Code")
 	}
 
-	return (*out.InstanceStatuses[0].InstanceState.Code & 0xFF) < 32, nil
+	switch (*out.InstanceStatuses[0].InstanceState.Code & 0xFF) / 16 {
+	case 0:
+		return ServerStateStarting, nil
+	case 1:
+		return ServerStateOn, nil
+	case 2, 4:
+		return ServerStateStopping, nil
+	case 3, 5:
+		return ServerStateOff, nil
+	default:
+		return 0, fmt.Errorf(
+			"unknown instance state returned from AWS %v",
+			*out.InstanceStatuses[0].InstanceState.Code,
+		)
+	}
 }
 
 func (e *ec2Server) StartServer() error {

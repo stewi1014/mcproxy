@@ -1,3 +1,5 @@
+// package protocol is only made possible by the amazing documentation at
+// https://wiki.vg/Protocol
 package protocol
 
 import (
@@ -91,7 +93,11 @@ func (c *Conn) PipeTo(ctx context.Context, handshake *HandshakeIntention, conn n
 	}()
 
 	<-ctx.Done()
-	return context.Cause(ctx)
+	err = context.Cause(ctx)
+	if errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
 }
 
 func (c *Conn) Version() int {

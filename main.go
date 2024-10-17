@@ -2,7 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -68,7 +70,6 @@ func main() {
 }
 
 func handleHandshake(config Config, conn net.Conn, proxies map[string]*Proxy) {
-	fmt.Printf("client %v connected\n", conn.RemoteAddr())
 	log := log.New(os.Stderr, conn.RemoteAddr().String()+" ", log.LstdFlags)
 
 	defer conn.Close()
@@ -84,15 +85,19 @@ func handleHandshake(config Config, conn net.Conn, proxies map[string]*Proxy) {
 	proxy, ok := proxies[string(handshake.ServerAddress)]
 	if ok {
 		if handshake.NextState == protocol.StateStatus {
-			err := proxy.handleStatus(mcconn)
+			err := proxy.HandleStatus(mcconn)
 			if err != nil {
-				log.Println(err)
+				if !errors.Is(err, io.EOF) {
+					log.Println(err)
+				}
 				return
 			}
 		} else if handshake.NextState == protocol.StateLogin {
-			err := proxy.handleLogin(handshake, mcconn)
+			err := proxy.HandleLogin(handshake, mcconn)
 			if err != nil {
-				log.Println(err)
+				if !errors.Is(err, io.EOF) {
+					log.Println(err)
+				}
 				return
 			}
 		} else {
@@ -110,7 +115,9 @@ func handleHandshake(config Config, conn net.Conn, proxies map[string]*Proxy) {
 			)
 
 			if err != nil {
-				log.Println(err)
+				if !errors.Is(err, io.EOF) {
+					log.Println(err)
+				}
 				return
 			}
 
