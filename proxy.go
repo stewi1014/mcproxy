@@ -140,7 +140,7 @@ func (p *Proxy) stopServer() {
 			return
 		}
 
-		if lastPlayer.Add(p.shutdown_timeout).Before(time.Now()) {
+		if lastPlayer.Add(p.shutdown_timeout).Before(time.Now()) && lastSuccess.After(lastPlayer) {
 			log.Printf("stopping server %v\n", p.domain)
 			err := p.server.StopServer()
 			if err != nil {
@@ -295,6 +295,13 @@ func (p *Proxy) HandleLogin(handshake *protocol.HandshakeIntention, mcconn *prot
 		return mcconn.WritePacket(&disconect)
 
 	case ServerStateOn:
+		for range 10 {
+			_, err := p.getServerStatus()
+			if err == nil {
+				return p.pipeClient(handshake, mcconn)
+			}
+			time.Sleep(time.Second)
+		}
 		return p.pipeClient(handshake, mcconn)
 
 	case ServerStateStopping:
@@ -304,7 +311,7 @@ func (p *Proxy) HandleLogin(handshake *protocol.HandshakeIntention, mcconn *prot
 	}
 
 	var disconect protocol.Disconnect
-	disconect.JSONTextComponent.Text = fmt.Sprintf("I'm supposed to know what \"%v\" means but I don't", serverState)
+	disconect.JSONTextComponent.Text = "This should never happen"
 	return mcconn.WritePacket(&disconect)
 }
 
