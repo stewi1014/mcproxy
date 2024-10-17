@@ -120,6 +120,7 @@ func (p *Proxy) handleServer() {
 			}
 		case <-p.startServerChan:
 			if p.serverState == serverStateStopped {
+				p.serverState = serverStateStarting
 				startTime = time.Now()
 				if lastStartDuration != 0 {
 					p.serverEstStarted = time.Now().Add(lastStartDuration)
@@ -130,8 +131,6 @@ func (p *Proxy) handleServer() {
 				if err != nil {
 					p.serverState = serverStateFucked
 				}
-
-				p.serverState = serverStateStarting
 			}
 		}
 	}
