@@ -14,7 +14,7 @@ import (
 )
 
 type ProxyConfig struct {
-	Domain               string
+	Domains              []string
 	Destination_Ip       string
 	Destination_Port     int
 	Destination_Protocol int
@@ -28,7 +28,7 @@ type ProxyConfig struct {
 func NewProxy(config ProxyConfig) (*Proxy, error) {
 	var proxy Proxy
 
-	proxy.domain = config.Domain
+	proxy.domains = config.Domains
 	proxy.destination_ip = config.Destination_Ip
 	proxy.destination_port = config.Destination_Port
 	proxy.status.protocolVersion = config.Destination_Protocol
@@ -50,21 +50,20 @@ func NewProxy(config ProxyConfig) (*Proxy, error) {
 		if mcErr == nil {
 			log.Printf(
 				"%v is running version %v: \"%v\"\n",
-				proxy.domain,
+				proxy.domains,
 				status.JSONResponse.Version.Name,
 				status.JSONResponse.Description,
 			)
 			proxy.stopServer()
 		} else {
-			log.Printf("%v is stopped\n", proxy.domain)
+			log.Printf("%v is stopped\n", proxy.domains)
 		}
-
 	}()
 	return &proxy, nil
 }
 
 type Proxy struct {
-	domain           string
+	domains          []string
 	destination_ip   string
 	destination_port int
 	shutdown_timeout time.Duration
@@ -88,7 +87,7 @@ type Proxy struct {
 
 func (p *Proxy) startServer() {
 	p.mutex.Lock()
-	log.Printf("starting server %v\n", p.domain)
+	log.Printf("starting server %v\n", p.domains)
 	err := p.server.StartServer()
 	if err != nil {
 		p.mutex.Unlock()
@@ -141,7 +140,7 @@ func (p *Proxy) stopServer() {
 		}
 
 		if lastPlayer.Add(p.shutdown_timeout).Before(time.Now()) && lastSuccess.After(lastPlayer) {
-			log.Printf("stopping server %v\n", p.domain)
+			log.Printf("stopping server %v\n", p.domains)
 			err := p.server.StopServer()
 			if err != nil {
 				log.Println(err)

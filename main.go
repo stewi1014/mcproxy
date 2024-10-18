@@ -47,10 +47,12 @@ func main() {
 	for _, proxyConfig := range config.Proxies {
 		proxy, err := NewProxy(proxyConfig)
 		if err != nil {
-			fmt.Println(proxyConfig.Domain, err)
+			fmt.Println(proxyConfig.Domains, err)
 			return
 		}
-		proxies[proxyConfig.Domain] = proxy
+		for _, domain := range proxyConfig.Domains {
+			proxies[domain] = proxy
+		}
 	}
 
 	l, err := net.Listen("tcp", config.Listen.Address)
