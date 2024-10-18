@@ -183,6 +183,8 @@ func (p *Proxy) HandleStatus(conn *protocol.Conn) error {
 			} else {
 				p.mutex.Lock()
 				pStatus := p.status
+				lastStartDuration := p.lastStartDuration
+				lastStart := p.lastStart
 				p.mutex.Unlock()
 
 				var resp protocol.StatusResponse
@@ -201,16 +203,31 @@ func (p *Proxy) HandleStatus(conn *protocol.Conn) error {
 					if err != nil {
 						return err
 					}
+
 				} else {
 					switch serverState {
 					case ServerStateOff:
 						resp.JSONResponse.Description = fmt.Sprintf("(sleeping) %v", pStatus.description)
-					case ServerStateStarting:
-						resp.JSONResponse.Description = fmt.Sprintf("(starting) %v", pStatus.description)
-					case ServerStateOn:
-						resp.JSONResponse.Description = pStatus.description
+
+					case ServerStateOn, ServerStateStarting:
+						if serverState == ServerStateOn && lastStart.Add(p.shutdown_timeout).Before(time.Now()) {
+							resp.JSONResponse.Description = fmt.Sprintf("(not responding) %v", pStatus.description)
+
+						} else if !lastStart.IsZero() && lastStartDuration != 0 {
+							resp.JSONResponse.Description = fmt.Sprintf(
+								"(starting approx %v) %v",
+								lastStart.Add(lastStartDuration).Sub(time.Now()),
+								pStatus.description,
+							)
+
+						} else {
+							resp.JSONResponse.Description = fmt.Sprintf("(starting) %v", pStatus.description)
+
+						}
+
 					case ServerStateStopping:
 						resp.JSONResponse.Description = fmt.Sprintf("(stopping) %v", pStatus.description)
+
 					}
 				}
 
