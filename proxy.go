@@ -85,19 +85,19 @@ type Proxy struct {
 	}
 }
 
-func (p *Proxy) startServer() {
+func (p *Proxy) startServer() error {
 	p.mutex.Lock()
 	log.Printf("starting server %v\n", p.domains)
 	err := p.server.StartServer()
 	if err != nil {
 		p.mutex.Unlock()
 		log.Println(err)
-		return
+		return err
 	}
 
 	if !p.lastStart.IsZero() {
 		p.mutex.Unlock()
-		return
+		return nil
 	}
 	p.lastStart = time.Now()
 	defer func() {
@@ -107,27 +107,33 @@ func (p *Proxy) startServer() {
 	}()
 	p.mutex.Unlock()
 
-	for range time.NewTicker(time.Second).C {
-		_, err := p.getServerStatus()
-		if err == nil {
-			p.mutex.Lock()
-			p.lastStartDuration = time.Now().Sub(p.lastStart)
-			p.mutex.Unlock()
-			go p.stopServer()
-			return
-		}
+	go func() {
+		for range time.NewTicker(time.Second).C {
+			_, err := p.getServerStatus()
+			if err == nil {
+				p.mutex.Lock()
+				p.lastStartDuration = time.Now().Sub(p.lastStart)
+				p.mutex.Unlock()
+				p.stopServer()
+				return
+			}
 
-		if time.Now().Sub(p.lastStart) > time.Minute*10 {
-			log.Printf("server start timed out %+v\n", p)
-			return
+			if time.Now().Sub(p.lastStart) > time.Minute*20 {
+				log.Printf("server start timed out. giving up and shutting it down %+v\n", p)
+				p.stopServer()
+				return
+			}
 		}
-	}
+	}()
 
-	panic("not reached")
+	return nil
 }
 
 func (p *Proxy) stopServer() {
 	lastSuccess, lastPlayer := time.Now(), time.Now()
+
+	var err error
+	var status *protocol.StatusResponse
 
 	for {
 		if lastSuccess.Add(p.shutdown_timeout).Before(time.Now()) {
@@ -139,7 +145,7 @@ func (p *Proxy) stopServer() {
 			return
 		}
 
-		if lastPlayer.Add(p.shutdown_timeout).Before(time.Now()) && lastSuccess.After(lastPlayer) {
+		if lastPlayer.Add(p.shutdown_timeout).Before(time.Now()) && err == nil {
 			log.Printf("stopping server %v\n", p.domains)
 			err := p.server.StopServer()
 			if err != nil {
@@ -149,7 +155,7 @@ func (p *Proxy) stopServer() {
 		}
 
 		time.Sleep(p.shutdown_timeout / 20)
-		status, err := p.getServerStatus()
+		status, err = p.getServerStatus()
 		if err != nil {
 			continue
 		}
@@ -216,7 +222,7 @@ func (p *Proxy) HandleStatus(conn *protocol.Conn) error {
 						} else if !lastStart.IsZero() && lastStartDuration != 0 {
 							resp.JSONResponse.Description = fmt.Sprintf(
 								"(starting approx %v) %v",
-								lastStart.Add(lastStartDuration).Sub(time.Now()),
+								lastStart.Add(lastStartDuration).Sub(time.Now()).Round(time.Second),
 								pStatus.description,
 							)
 
@@ -263,21 +269,27 @@ func (p *Proxy) HandleLogin(handshake *protocol.HandshakeIntention, mcconn *prot
 
 	switch serverState {
 	case ServerStateOff:
-		go p.startServer()
 		var disconnect protocol.Disconnect
-		p.mutex.Lock()
-		lastStartDuration := p.lastStartDuration
-		p.mutex.Unlock()
+		err := p.startServer()
+		if err != nil {
+			disconnect.JSONTextComponent.Text = fmt.Sprintf("Failed to start server: %v", err)
 
-		time.Sleep(time.Second * 10)
-
-		if lastStartDuration != 0 {
-			disconnect.JSONTextComponent.Text = fmt.Sprintf(
-				"Server is started. Should be up in approx %v",
-				lastStartDuration,
-			)
 		} else {
-			disconnect.JSONTextComponent.Text = "Server has been started"
+			time.Sleep(time.Second * 10)
+
+			p.mutex.Lock()
+			lastStart := p.lastStart
+			lastStartDuration := p.lastStartDuration
+			p.mutex.Unlock()
+
+			if lastStartDuration != 0 {
+				disconnect.JSONTextComponent.Text = fmt.Sprintf(
+					"Server is started. Should be up in approx %v",
+					lastStart.Add(lastStartDuration).Sub(time.Now()).Round(time.Second),
+				)
+			} else {
+				disconnect.JSONTextComponent.Text = "Server has been started"
+			}
 		}
 		return mcconn.WritePacket(&disconnect)
 
