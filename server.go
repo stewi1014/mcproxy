@@ -17,9 +17,9 @@ const (
 )
 
 type Server interface {
-	State() (int, error)
-	StartServer() error
-	StopServer() error
+	State(ctx context.Context) (int, error)
+	StartServer(ctx context.Context) error
+	StopServer(ctx context.Context) error
 }
 
 type EC2Config struct {
@@ -47,10 +47,10 @@ type ec2Server struct {
 	hibernate   bool
 }
 
-func (e *ec2Server) State() (int, error) {
+func (e *ec2Server) State(ctx context.Context) (int, error) {
 	includeAll := true
 	client := ec2.NewFromConfig(e.aws_config)
-	out, err := client.DescribeInstanceStatus(context.TODO(), &ec2.DescribeInstanceStatusInput{
+	out, err := client.DescribeInstanceStatus(ctx, &ec2.DescribeInstanceStatusInput{
 		IncludeAllInstances: &includeAll,
 		InstanceIds:         []string{e.instance_id},
 	})
@@ -87,9 +87,9 @@ func (e *ec2Server) State() (int, error) {
 	}
 }
 
-func (e *ec2Server) StartServer() error {
+func (e *ec2Server) StartServer(ctx context.Context) error {
 	client := ec2.NewFromConfig(e.aws_config)
-	_, err := client.StartInstances(context.TODO(), &ec2.StartInstancesInput{
+	_, err := client.StartInstances(ctx, &ec2.StartInstancesInput{
 		InstanceIds: []string{e.instance_id},
 	})
 	if err != nil {
@@ -99,10 +99,10 @@ func (e *ec2Server) StartServer() error {
 	return nil
 }
 
-func (e *ec2Server) StopServer() error {
+func (e *ec2Server) StopServer(ctx context.Context) error {
 	client := ec2.NewFromConfig(e.aws_config)
 
-	_, err := client.StopInstances(context.TODO(), &ec2.StopInstancesInput{
+	_, err := client.StopInstances(ctx, &ec2.StopInstancesInput{
 		InstanceIds: []string{e.instance_id},
 		Hibernate:   &e.hibernate,
 	})

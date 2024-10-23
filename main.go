@@ -45,9 +45,10 @@ func main() {
 	proxies := make(map[string]*Proxy)
 
 	for _, proxyConfig := range config.Proxies {
+		proxyConfig.Logger = log.New(os.Stderr, fmt.Sprint(proxyConfig.Domains), log.LstdFlags)
 		proxy, err := NewProxy(proxyConfig)
 		if err != nil {
-			fmt.Println(proxyConfig.Domains, err)
+			log.Fatalln(proxyConfig.Domains, err)
 			return
 		}
 		for _, domain := range proxyConfig.Domains {
@@ -57,7 +58,7 @@ func main() {
 
 	l, err := net.Listen("tcp", config.Listen.Address)
 	if err != nil {
-		fmt.Println(err)
+		log.Fatalln(err)
 		return
 	}
 
@@ -79,7 +80,7 @@ func handleHandshake(config Config, conn net.Conn, proxies map[string]*Proxy) {
 
 	packet, err := mcconn.ReadPacket(&protocol.HandshakeIntention{})
 	if err != nil {
-		log.Println(err)
+		log.Fatalln(err)
 		return
 	}
 
@@ -95,7 +96,7 @@ func handleHandshake(config Config, conn net.Conn, proxies map[string]*Proxy) {
 				return
 			}
 		} else if handshake.NextState == protocol.StateLogin {
-			err := proxy.HandleLogin(handshake, mcconn)
+			err := proxy.HandleLogin(handshake, mcconn, conn.RemoteAddr())
 			if err != nil {
 				if !errors.Is(err, io.EOF) {
 					log.Println(err)
@@ -144,6 +145,8 @@ func handleHandshake(config Config, conn net.Conn, proxies map[string]*Proxy) {
 					log.Println(err)
 					return
 				}
+			default:
+				panic(fmt.Sprintf("%t returned by Conn.ReadPacket but is not a valid response payload", packet))
 			}
 		}
 	}

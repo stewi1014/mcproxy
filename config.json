@@ -10,14 +10,14 @@
                 "example.localhost",
                 "example2.localhost"
             ],
-            "destination_ip": "lenqua.link",
-            "destination_port": 25560,
+            "destination_ip": "localhost",
+            "destination_port": 25564,
             "destination_version": "1.21.1",
             "destination_protocol": 767,
             "shutdown_timeout": 60,
             "ec2_server": {
                 "region": "ap-southeast-2",
-                "instance_id": "i-077dc0edcdeb157f9",
+                "instance_id": "i-0caec170ef93f842a",
                 "hibernate": false
             }
         }

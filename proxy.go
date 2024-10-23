@@ -23,11 +23,13 @@ type ProxyConfig struct {
 	Shutdown_Timeout int
 
 	Ec2_Server *EC2Config
+	Logger     *log.Logger
 }
 
 func NewProxy(config ProxyConfig) (*Proxy, error) {
 	var proxy Proxy
 
+	proxy.log = config.Logger
 	proxy.domains = config.Domains
 	proxy.destination_ip = config.Destination_Ip
 	proxy.destination_port = config.Destination_Port
@@ -46,15 +48,14 @@ func NewProxy(config ProxyConfig) (*Proxy, error) {
 	}
 
 	go func() {
-		status, mcErr := proxy.getServerStatus()
+		status, mcErr := proxy.getServerStatus(time.Second * 10)
 		if mcErr == nil {
-			log.Printf(
-				"%v is running version %v: \"%v\"\n",
-				proxy.domains,
+			proxy.log.Printf(
+				"running version %v: \"%v\"\n",
 				status.JSONResponse.Version.Name,
 				status.JSONResponse.Description,
 			)
-			proxy.stopServer()
+			proxy.stopWhenEmpty()
 		} else {
 			log.Printf("%v is stopped\n", proxy.domains)
 		}
@@ -63,13 +64,16 @@ func NewProxy(config ProxyConfig) (*Proxy, error) {
 }
 
 type Proxy struct {
+	log *log.Logger
+
 	domains          []string
 	destination_ip   string
 	destination_port int
 	shutdown_timeout time.Duration
 	connected        atomic.Int32
 
-	server Server
+	server     Server
+	hasStarted bool
 
 	mutex             sync.Mutex
 	lastStart         time.Time
@@ -87,41 +91,41 @@ type Proxy struct {
 
 func (p *Proxy) startServer() error {
 	p.mutex.Lock()
-	log.Printf("starting server %v\n", p.domains)
-	err := p.server.StartServer()
-	if err != nil {
-		p.mutex.Unlock()
-		log.Println(err)
-		return err
-	}
-
-	if !p.lastStart.IsZero() {
+	if p.hasStarted {
 		p.mutex.Unlock()
 		return nil
 	}
+	p.hasStarted = true
 	p.lastStart = time.Now()
-	defer func() {
-		p.mutex.Lock()
-		p.lastStart = time.Time{}
-		p.mutex.Unlock()
-	}()
 	p.mutex.Unlock()
 
+	p.log.Println("starting server")
+
+	err := p.server.StartServer(context.Background())
+	if err != nil {
+		return err
+	}
+
 	go func() {
-		for range time.NewTicker(time.Second).C {
-			_, err := p.getServerStatus()
+		for now := range time.NewTicker(time.Second * 2).C {
+			_, err := p.getServerStatus(time.Second * 10)
 			if err == nil {
+				p.log.Println("server has started")
 				p.mutex.Lock()
-				p.lastStartDuration = time.Now().Sub(p.lastStart)
+				p.lastStartDuration = now.Sub(p.lastStart)
 				p.mutex.Unlock()
-				p.stopServer()
+				p.stopWhenEmpty()
 				return
 			}
 
-			if time.Now().Sub(p.lastStart) > time.Minute*20 {
-				log.Printf("server start timed out. giving up and shutting it down %+v\n", p)
-				p.stopServer()
-				return
+			state, err := p.server.State(context.Background())
+			if err != nil {
+				p.log.Println("failed to get server state: ", err)
+			} else {
+				if state != ServerStateStarting && state != ServerStateOn {
+					p.log.Println("server shutdown before mc server could be connected to")
+					return
+				}
 			}
 		}
 	}()
@@ -129,40 +133,36 @@ func (p *Proxy) startServer() error {
 	return nil
 }
 
-func (p *Proxy) stopServer() {
-	lastSuccess, lastPlayer := time.Now(), time.Now()
+func (p *Proxy) stopWhenEmpty() {
+	defer func() {
+		p.mutex.Lock()
+		p.hasStarted = false
+		p.mutex.Unlock()
+	}()
 
-	var err error
-	var status *protocol.StatusResponse
-
-	for {
-		if lastSuccess.Add(p.shutdown_timeout).Before(time.Now()) {
-			log.Printf("server has frozen, trying to stop it; %+v\n", p)
-			err := p.server.StopServer()
-			if err != nil {
-				log.Println(err)
-			}
+	lastPlayer := time.Now()
+	for t := range time.NewTicker(p.shutdown_timeout / 10).C {
+		state, stateErr := p.server.State(context.Background())
+		if stateErr != nil {
+			p.log.Println("failed to get server state: ", stateErr)
+		} else if state != ServerStateStarting && state != ServerStateOn {
+			p.log.Println("server shut down externally")
 			return
 		}
 
-		if lastPlayer.Add(p.shutdown_timeout).Before(time.Now()) && err == nil {
-			log.Printf("stopping server %v\n", p.domains)
-			err := p.server.StopServer()
-			if err != nil {
-				log.Println(err)
+		status, statusErr := p.getServerStatus(time.Second * 10)
+		if statusErr == nil {
+			if status.JSONResponse.Players.Online > 0 {
+				lastPlayer = t
+			} else if lastPlayer.Add(p.shutdown_timeout).Before(t) {
+				err := p.server.StopServer(context.Background())
+				if err != nil {
+					p.log.Println("error stopping server:", err)
+				} else {
+					p.log.Println("stopping server")
+					return
+				}
 			}
-			return
-		}
-
-		time.Sleep(p.shutdown_timeout / 20)
-		status, err = p.getServerStatus()
-		if err != nil {
-			continue
-		}
-
-		lastSuccess = time.Now()
-		if status.JSONResponse.Players.Online > 0 {
-			lastPlayer = time.Now()
 		}
 	}
 }
@@ -180,68 +180,78 @@ func (p *Proxy) HandleStatus(conn *protocol.Conn) error {
 
 		switch packet := packet.(type) {
 		case *protocol.StatusRequest:
-			mcStatus, err := p.getServerStatus()
-			if err == nil {
-				err := conn.WritePacket(mcStatus)
-				if err != nil {
-					return err
-				}
-			} else {
-				p.mutex.Lock()
-				pStatus := p.status
-				lastStartDuration := p.lastStartDuration
-				lastStart := p.lastStart
-				p.mutex.Unlock()
+			state, stateErr := p.server.State(context.Background())
+			if stateErr != nil {
+				p.log.Println("failed to read server state:", stateErr)
 
-				var resp protocol.StatusResponse
-				resp.JSONResponse.Players.Online = 0
-				resp.JSONResponse.Players.Max = pStatus.maxPlayers
-				resp.JSONResponse.Version.Name = pStatus.versionName
-				resp.JSONResponse.Version.Protocol = pStatus.protocolVersion
-				resp.JSONResponse.Favicon = pStatus.favicon
-				resp.JSONResponse.EnforceSecureChat = pStatus.enforceSecureChat
-
-				serverState, err := p.server.State()
-				if err != nil {
-					resp.JSONResponse.Players.Max = 0
-					resp.JSONResponse.Description = "server is f**ked. sorry."
-					err := conn.WritePacket(&resp)
+				status, statusErr := p.getServerStatus(time.Second * 10)
+				if statusErr == nil {
+					err := conn.WritePacket(status)
 					if err != nil {
 						return err
 					}
+				}
+				return statusErr
+			}
 
+			p.mutex.Lock()
+			pStatus := p.status
+			lastStartDuration := p.lastStartDuration
+			lastStart := p.lastStart
+			p.mutex.Unlock()
+
+			var resp protocol.StatusResponse
+			resp.JSONResponse.Players.Online = 0
+			resp.JSONResponse.Players.Max = pStatus.maxPlayers
+			resp.JSONResponse.Version.Name = pStatus.versionName
+			resp.JSONResponse.Version.Protocol = pStatus.protocolVersion
+			resp.JSONResponse.Favicon = pStatus.favicon
+			resp.JSONResponse.EnforceSecureChat = pStatus.enforceSecureChat
+
+			switch state {
+			case ServerStateOff:
+				resp.JSONResponse.Description = fmt.Sprintf("(sleeping) %v", pStatus.description)
+
+			case ServerStateStarting:
+				if !lastStart.IsZero() && lastStartDuration != 0 {
+					resp.JSONResponse.Description = fmt.Sprintf(
+						"(starting approx %v) %v",
+						lastStart.Add(lastStartDuration).Sub(time.Now()).Round(time.Second),
+						pStatus.description,
+					)
 				} else {
-					switch serverState {
-					case ServerStateOff:
-						resp.JSONResponse.Description = fmt.Sprintf("(sleeping) %v", pStatus.description)
+					resp.JSONResponse.Description = fmt.Sprintf("(starting) %v", pStatus.description)
+				}
 
-					case ServerStateOn, ServerStateStarting:
-						if serverState == ServerStateOn && lastStart.Add(p.shutdown_timeout).Before(time.Now()) {
-							resp.JSONResponse.Description = fmt.Sprintf("(not responding) %v", pStatus.description)
-
-						} else if !lastStart.IsZero() && lastStartDuration != 0 {
+			case ServerStateOn:
+				status, err := p.getServerStatus(time.Second)
+				if err == nil {
+					resp = *status
+				} else {
+					if lastStart.Add(p.shutdown_timeout).Before(time.Now()) {
+						resp.JSONResponse.Description = fmt.Sprintf("(not responding) %v", pStatus.description)
+					} else {
+						if !lastStart.IsZero() && lastStartDuration != 0 {
 							resp.JSONResponse.Description = fmt.Sprintf(
 								"(starting approx %v) %v",
 								lastStart.Add(lastStartDuration).Sub(time.Now()).Round(time.Second),
 								pStatus.description,
 							)
-
 						} else {
 							resp.JSONResponse.Description = fmt.Sprintf("(starting) %v", pStatus.description)
-
 						}
-
-					case ServerStateStopping:
-						resp.JSONResponse.Description = fmt.Sprintf("(stopping) %v", pStatus.description)
-
 					}
 				}
 
-				err = conn.WritePacket(&resp)
-				if err != nil {
-					return err
-				}
+			case ServerStateStopping:
+				resp.JSONResponse.Description = fmt.Sprintf("(stopping) %v", pStatus.description)
 			}
+
+			err = conn.WritePacket(&resp)
+			if err != nil {
+				return err
+			}
+
 		case *protocol.PingRequest:
 			var pongResponse protocol.PongResponse
 			pongResponse.Payload = packet.Payload
@@ -253,11 +263,12 @@ func (p *Proxy) HandleStatus(conn *protocol.Conn) error {
 	}
 }
 
-func (p *Proxy) HandleLogin(handshake *protocol.HandshakeIntention, mcconn *protocol.Conn) error {
-	serverState, err := p.server.State()
+func (p *Proxy) HandleLogin(handshake *protocol.HandshakeIntention, mcconn *protocol.Conn, raddr net.Addr) error {
+	p.log.Println("login from", raddr)
+	serverState, err := p.server.State(context.Background())
 	if err != nil {
-		log.Println(err)
-		_, mcErr := p.getServerStatus()
+		p.log.Println(err)
+		_, mcErr := p.getServerStatus(time.Second * 10)
 		if mcErr == nil {
 			return p.pipeClient(handshake, mcconn)
 		} else {
@@ -297,7 +308,7 @@ func (p *Proxy) HandleLogin(handshake *protocol.HandshakeIntention, mcconn *prot
 		start := time.Now()
 		t := time.NewTicker(time.Second)
 		for now := range t.C {
-			_, err := p.getServerStatus()
+			_, err := p.getServerStatus(time.Second * 10)
 			if err == nil {
 				return p.pipeClient(handshake, mcconn)
 			}
@@ -324,11 +335,11 @@ func (p *Proxy) HandleLogin(handshake *protocol.HandshakeIntention, mcconn *prot
 
 	case ServerStateOn:
 		for range 10 {
-			_, err := p.getServerStatus()
+			_, err := p.getServerStatus(time.Second * 10)
 			if err == nil {
 				return p.pipeClient(handshake, mcconn)
 			}
-			time.Sleep(time.Second)
+			time.Sleep(time.Second * 2)
 		}
 		return p.pipeClient(handshake, mcconn)
 
@@ -354,11 +365,11 @@ func (p *Proxy) pipeClient(handshake *protocol.HandshakeIntention, mcconn *proto
 	return mcconn.PipeTo(context.Background(), handshake, conn)
 }
 
-func (p *Proxy) getServerStatus() (*protocol.StatusResponse, error) {
+func (p *Proxy) getServerStatus(timeout time.Duration) (*protocol.StatusResponse, error) {
 	conn, err := net.DialTimeout(
 		"tcp",
 		fmt.Sprintf("%v:%v", p.destination_ip, p.destination_port),
-		time.Second*2,
+		timeout,
 	)
 	if err != nil {
 		return &protocol.StatusResponse{}, err
@@ -397,14 +408,16 @@ func (p *Proxy) getServerStatus() (*protocol.StatusResponse, error) {
 
 	statusResponse := resposePacket.(*protocol.StatusResponse)
 
-	p.mutex.Lock()
-	p.status.description = statusResponse.JSONResponse.Description
-	p.status.enforceSecureChat = statusResponse.JSONResponse.EnforceSecureChat
-	p.status.favicon = statusResponse.JSONResponse.Favicon
-	p.status.maxPlayers = statusResponse.JSONResponse.Players.Max
-	p.status.protocolVersion = statusResponse.JSONResponse.Version.Protocol
-	p.status.versionName = statusResponse.JSONResponse.Version.Name
-	p.mutex.Unlock()
+	go func() {
+		p.mutex.Lock()
+		p.status.description = statusResponse.JSONResponse.Description
+		p.status.enforceSecureChat = statusResponse.JSONResponse.EnforceSecureChat
+		p.status.favicon = statusResponse.JSONResponse.Favicon
+		p.status.maxPlayers = statusResponse.JSONResponse.Players.Max
+		p.status.protocolVersion = statusResponse.JSONResponse.Version.Protocol
+		p.status.versionName = statusResponse.JSONResponse.Version.Name
+		p.mutex.Unlock()
+	}()
 
 	return statusResponse, err
 }
