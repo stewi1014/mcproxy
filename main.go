@@ -80,7 +80,7 @@ func handleHandshake(config Config, conn net.Conn, proxies map[string]*Proxy) {
 
 	packet, err := mcconn.ReadPacket(&protocol.HandshakeIntention{})
 	if err != nil {
-		log.Fatalln(err)
+		log.Println(err)
 		return
 	}
 
