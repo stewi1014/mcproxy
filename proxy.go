@@ -72,12 +72,13 @@ type Proxy struct {
 	destination_port int
 	shutdown_timeout time.Duration
 
-	server            Server
-	currentlyStarting bool
+	startMutex sync.Mutex
+	server     Server
 
 	mutex             sync.Mutex
 	players           int
 	shutdownTimer     *time.Timer
+	shutdownTime      time.Time
 	lastStart         time.Time
 	lastStartDuration time.Duration
 
@@ -92,29 +93,26 @@ type Proxy struct {
 }
 
 func (p *Proxy) startServer() error {
-	p.mutex.Lock()
-	if p.currentlyStarting {
-		p.mutex.Unlock()
+	p.startMutex.Lock()
+	defer p.startMutex.Unlock()
+
+	state, err := p.server.State(context.Background())
+	if err != nil {
+		return err
+	}
+
+	if state != ServerStateOff {
+		p.log.Println("not starting, server already on")
 		return nil
 	}
-	p.currentlyStarting = true
-	p.lastStart = time.Now()
-	p.mutex.Unlock()
 
 	p.log.Println("starting server")
-
-	err := p.server.StartServer(context.Background())
+	err = p.server.StartServer(context.Background())
 	if err != nil {
 		return err
 	}
 
 	go func() {
-		defer func() {
-			p.mutex.Lock()
-			p.currentlyStarting = false
-			p.mutex.Unlock()
-		}()
-
 		for now := range time.NewTicker(time.Second * 2).C {
 			_, err := p.getServerStatus(time.Second * 10)
 			if err == nil {
@@ -122,13 +120,13 @@ func (p *Proxy) startServer() error {
 				p.mutex.Lock()
 				p.lastStartDuration = now.Sub(p.lastStart)
 				p.mutex.Unlock()
-				p.stopWhenEmpty()
 				return
 			}
 
 			state, err := p.server.State(context.Background())
 			if err != nil {
-				p.log.Println("failed to get server state: ", err)
+				p.log.Println(err)
+				return
 			} else {
 				if state != ServerStateStarting && state != ServerStateOn {
 					p.log.Println("server shutdown before mc server could be connected to")
@@ -220,8 +218,13 @@ func (p *Proxy) HandleStatus(conn *protocol.Conn) error {
 				status, err := p.getServerStatus(time.Second)
 				if err == nil {
 					resp = *status
+					p.mutex.Lock()
+					if !p.shutdownTime.IsZero() {
+						resp.JSONResponse.Description = fmt.Sprintf("(shutdown in %v) %v", time.Now().Sub(p.shutdownTime).Round(time.Second), status.JSONResponse.Description)
+					}
+					p.mutex.Unlock()
 				} else {
-					if lastStart.Add(p.shutdown_timeout).Before(time.Now()) {
+					if lastStart.Add(lastStartDuration).Before(time.Now()) { //don't mind if these are both nil
 						resp.JSONResponse.Description = fmt.Sprintf("(not responding) %v", pStatus.description)
 					} else {
 						if !lastStart.IsZero() && lastStartDuration != 0 {
@@ -260,12 +263,17 @@ func (p *Proxy) HandleLogin(handshake *protocol.HandshakeIntention, mcconn *prot
 	p.log.Println("login from", raddr)
 	p.mutex.Lock()
 	p.players++
-	p.shutdownTimer.Stop()
+	p.shutdownTime = time.Time{}
+	if p.shutdownTimer.Stop() {
+		p.log.Println("canceled shutdown")
+	}
 	p.mutex.Unlock()
 	defer func() {
 		p.mutex.Lock()
 		p.players--
 		if p.players == 0 {
+			p.shutdownTime = time.Now().Add(p.shutdown_timeout)
+			p.log.Println("scheduling shutdown for", p.shutdownTime.Round(time.Second))
 			p.shutdownTimer.Reset(p.shutdown_timeout)
 		}
 		p.mutex.Unlock()
