@@ -1,6 +1,6 @@
 {
     "listen": {
-        "address": ":25565",
+        "address": ":25564",
         "fallback_version": "1.21.1",
         "fallback_protocol": 767
     },
@@ -11,13 +11,13 @@
                 "example2.localhost"
             ],
             "destination_ip": "localhost",
-            "destination_port": 25564,
+            "destination_port": 25565,
             "destination_version": "1.21.1",
             "destination_protocol": 767,
-            "shutdown_timeout": 60,
+            "shutdown_timeout": 120,
             "ec2_server": {
                 "region": "ap-southeast-2",
-                "instance_id": "i-0caec170ef93f842a",
+                "instance_id": "i-06b6ba54308022bec",
                 "hibernate": false
             }
         }

@@ -7,7 +7,6 @@ import (
 	"log"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/stewi1014/mcproxy/protocol"
@@ -47,6 +46,9 @@ func NewProxy(config ProxyConfig) (*Proxy, error) {
 		return nil, errors.New("no backend provided for proxy")
 	}
 
+	proxy.shutdownTimer = time.NewTimer(proxy.shutdown_timeout)
+	go proxy.stopWhenEmpty()
+
 	go func() {
 		status, mcErr := proxy.getServerStatus(time.Second * 10)
 		if mcErr == nil {
@@ -55,9 +57,8 @@ func NewProxy(config ProxyConfig) (*Proxy, error) {
 				status.JSONResponse.Version.Name,
 				status.JSONResponse.Description,
 			)
-			proxy.stopWhenEmpty()
 		} else {
-			log.Printf("%v is stopped\n", proxy.domains)
+			proxy.log.Println("server didn't respond")
 		}
 	}()
 	return &proxy, nil
@@ -70,12 +71,13 @@ type Proxy struct {
 	destination_ip   string
 	destination_port int
 	shutdown_timeout time.Duration
-	connected        atomic.Int32
 
-	server     Server
-	hasStarted bool
+	server            Server
+	currentlyStarting bool
 
 	mutex             sync.Mutex
+	players           int
+	shutdownTimer     *time.Timer
 	lastStart         time.Time
 	lastStartDuration time.Duration
 
@@ -91,11 +93,11 @@ type Proxy struct {
 
 func (p *Proxy) startServer() error {
 	p.mutex.Lock()
-	if p.hasStarted {
+	if p.currentlyStarting {
 		p.mutex.Unlock()
 		return nil
 	}
-	p.hasStarted = true
+	p.currentlyStarting = true
 	p.lastStart = time.Now()
 	p.mutex.Unlock()
 
@@ -107,6 +109,12 @@ func (p *Proxy) startServer() error {
 	}
 
 	go func() {
+		defer func() {
+			p.mutex.Lock()
+			p.currentlyStarting = false
+			p.mutex.Unlock()
+		}()
+
 		for now := range time.NewTicker(time.Second * 2).C {
 			_, err := p.getServerStatus(time.Second * 10)
 			if err == nil {
@@ -134,35 +142,20 @@ func (p *Proxy) startServer() error {
 }
 
 func (p *Proxy) stopWhenEmpty() {
-	defer func() {
-		p.mutex.Lock()
-		p.hasStarted = false
-		p.mutex.Unlock()
-	}()
-
-	lastPlayer := time.Now()
-	for t := range time.NewTicker(p.shutdown_timeout / 10).C {
+	for range p.shutdownTimer.C {
 		state, stateErr := p.server.State(context.Background())
 		if stateErr != nil {
 			p.log.Println("failed to get server state: ", stateErr)
 		} else if state != ServerStateStarting && state != ServerStateOn {
 			p.log.Println("server shut down externally")
-			return
+			continue
 		}
 
-		status, statusErr := p.getServerStatus(time.Second * 10)
-		if statusErr == nil {
-			if status.JSONResponse.Players.Online > 0 {
-				lastPlayer = t
-			} else if lastPlayer.Add(p.shutdown_timeout).Before(t) {
-				err := p.server.StopServer(context.Background())
-				if err != nil {
-					p.log.Println("error stopping server:", err)
-				} else {
-					p.log.Println("stopping server")
-					return
-				}
-			}
+		err := p.server.StopServer(context.Background())
+		if err != nil {
+			p.log.Println("error stopping server:", err)
+		} else {
+			p.log.Println("stopping server")
 		}
 	}
 }
@@ -265,6 +258,19 @@ func (p *Proxy) HandleStatus(conn *protocol.Conn) error {
 
 func (p *Proxy) HandleLogin(handshake *protocol.HandshakeIntention, mcconn *protocol.Conn, raddr net.Addr) error {
 	p.log.Println("login from", raddr)
+	p.mutex.Lock()
+	p.players++
+	p.shutdownTimer.Stop()
+	p.mutex.Unlock()
+	defer func() {
+		p.mutex.Lock()
+		p.players--
+		if p.players == 0 {
+			p.shutdownTimer.Reset(p.shutdown_timeout)
+		}
+		p.mutex.Unlock()
+	}()
+
 	serverState, err := p.server.State(context.Background())
 	if err != nil {
 		p.log.Println(err)
@@ -360,8 +366,6 @@ func (p *Proxy) pipeClient(handshake *protocol.HandshakeIntention, mcconn *proto
 		return err
 	}
 
-	p.connected.Add(1)
-	defer p.connected.Add(-1)
 	return mcconn.PipeTo(context.Background(), handshake, conn)
 }
 
